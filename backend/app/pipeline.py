@@ -1,4 +1,4 @@
-"""跨模块数据链路：把22个独立领域服务串联成10条端到端生产流水线。
+"""跨模块数据链路：把23个独立领域服务串联成11条端到端生产流水线。
 
 每条链路从上游模块取输入数据，做领域校验、转换与状态推进后，把产物写入下游模块：
 链路1  流程模板发布 → 排程触发 → 任务队列派发 → 机器人节点执行 → 步骤轨迹
@@ -11,10 +11,16 @@
 链路8  资源额度耗尽 → 机器人节点降级 → 任务队列回收
 链路9  OCR识别区域 → 采集批次归集 → 抽检样本 → 交接包驳回
 链路10 运行指标汇总 → 执行实例逐条核对 → 审计轨迹
+链路11 失败排程批量核对 → 补采清单 → 任务队列领用 → 迟到回执/中断接续 → 按来源
+       与业务日期归集确认回写
 
 额外能力：水位推进（data_landing watermark）、冲突版本仲裁（version_release rollback =
 旧版本胜出）、失败恢复（retry_policy 重试→放弃→审计）、去重（capture_batch 按采集窗
 口与上游来源判重，重复批次不落库）、迟到数据（schedule_plan 生效止日已过则拒绝投递）。
+
+链路11 失败排程批量核对 → 补采清单 → 任务队列领用 → 迟到回执/中断接续 → 按来源与
+业务日期归集确认回写。覆盖范围按「上游来源 + 业务日期」精确判定：共用范围的有效归集
+只计一次，迟到回执只证明它携带的日期，同名分片不能判整组完成。
 """
 from __future__ import annotations
 
@@ -607,3 +613,308 @@ def summarize_metrics(metric_id: int) -> dict[str, Any]:
         "mismatch": mismatch,
         "audit_id": audit_result["id"],
     }
+
+# ── 链路11: 失败排程批量核对 → 补采清单 → 任务队列 → 迟到回执/中断接续 → 归集确认回写 ─
+
+
+def _recap_audit(target: str, op_type: str, summary: str, mark: str) -> int:
+    """补采链路统一写审计轨迹，保证中断、迟到、确认均可查。"""
+    audit_svc = service_for("audit_trail")
+    if audit_svc is None:
+        return -1
+    values = {
+        "条目编号": f"AUDI-{mark}-{_epoch_ms()}",
+        "操作对象": target,
+        "操作类型": op_type,
+        "操作者标识": "duty-operator",
+        "操作时间": _now_iso(),
+        "变更摘要": summary,
+        "关联执行": "",
+        "追溯标记": f"{mark}-{_epoch_ms()}",
+    }
+    result, _ = audit_svc.create_entry(values)
+    return result["id"]
+
+
+def build_recapture_plan(plan_ids: list[int]) -> dict[str, Any]:
+    """批量核对失败排程：从已确认范围按来源筛出真正缺口，生成补采清单。
+
+    已被已确认批次覆盖的 (来源, 业务日期) 不进清单；同范围多排程折叠
+    成一条补采条目（有效归集只计一次），各排程仍保留自己的核对账本。
+    """
+    recapture_svc = service_for("recapture_list")
+    result = recapture_svc.build_from_plans(list(plan_ids))
+    if not result.get("ok"):
+        return result
+    _recap_audit(
+        "补采清单",
+        "补采清单生成",
+        (f"核对排程{len(plan_ids)}条：缺口{result['gap_count']}项，"
+         f"已覆盖{len(result['covered'])}项，跳过{len(result['skipped'])}项"),
+        "recap-build",
+    )
+    return {
+        "status": "planned",
+        "gap_count": result["gap_count"],
+        "item_ids": [it["id"] for it in result["created"]],
+        "covered": result["covered"],
+        "skipped": result["skipped"],
+    }
+
+
+def claim_recapture_attempt(item_ids: list[int], node_code: str) -> dict[str, Any]:
+    """让系统领用一组补采条目：逐条入任务队列并尝试派发到指定节点。
+
+    节点并发额度（来自 robot_node.并发额度）是名额上限；派发前
+    已确认范围防护生效，被迟到回执覆盖的任务不会被派发。
+    """
+    recapture_svc = service_for("recapture_list")
+    queue_svc = service_for("task_queue")
+    node_svc = service_for("robot_node")
+
+    node = None
+    if node_svc is not None:
+        for cand in node_svc.list_entries(size=1000)[0]:
+            if cand.get("节点编号") == node_code:
+                node = cand
+                break
+    capacity = int(node.get("并发额度", "1") or "1") if node is not None else 1
+    claimed = 0
+    tasks: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+
+    for item_id in item_ids:
+        item = recapture_svc.get_entry(int(item_id))
+        if item is None:
+            blocked.append({"item_id": item_id, "reason": "补采条目不存在"})
+            continue
+        if item.get("已核结果") in ("已确认", "已覆盖"):
+            blocked.append({
+                "item_id": item_id,
+                "reason": f"{item.get('来源分片')}的{item.get('业务日期')}已确认，无需领用",
+            })
+            continue
+        if item.get("已核结果") == "补采中":
+            blocked.append({
+                "item_id": item_id,
+                "reason": f"{item.get('来源分片')}的{item.get('业务日期')}已在补采中，不可重复领用",
+            })
+            continue
+        if claimed >= capacity:
+            blocked.append({"item_id": item_id, "reason": f"节点{node_code}名额已占满"})
+            continue
+
+        plan_svc = service_for("schedule_plan")
+        linked = item.get("_关联排程ids", [])
+        linked_codes = "、".join(
+            (plan_svc.get_entry(pid) or {}).get("计划编号", str(pid)) for pid in linked
+        )
+        task = queue_svc.enqueue_recapture_task(
+            source=item["来源分片"],
+            biz_date=item["业务日期"],
+            recapture_item_id=item["id"],
+            linked_plan_codes=linked_codes,
+        )
+        dispatch = queue_svc.dispatch_to_node(task["id"], node_code)
+        if dispatch.get("ok"):
+            recapture_svc.run_action(item["id"], "领用补采")
+            item["已核结果"] = "补采中"
+            item["占用任务"] = task["队列编号"]
+            claimed += 1
+            tasks.append({
+                "task_id": task["id"],
+                "item_id": item["id"],
+                "来源分片": item["来源分片"],
+                "业务日期": item["业务日期"],
+                "node": node_code,
+            })
+        else:
+            # 派发被已确认范围拦截：任务直接回收，条目标记为已覆盖
+            recapture_svc.run_action(item["id"], "标记覆盖")
+            item["已核结果"] = "已覆盖"
+            item["批次回执"] = "scope-covered"
+            blocked.append({
+                "item_id": item_id,
+                "task_id": task["id"],
+                "reason": dispatch.get("reason", "派发被拦截"),
+            })
+
+    _recap_audit(
+        "任务队列",
+        "补采领用",
+        f"领用{len(tasks)}项补采任务到节点{node_code}，拦截{len(blocked)}项",
+        "recap-claim",
+    )
+    return {"status": "claimed", "tasks": tasks, "blocked": blocked, "node": node_code}
+
+
+def register_late_receipt(source: str, biz_date: str, checksum: str) -> dict[str, Any]:
+    """接收旧机器人迟到的 L 回执：只证明 source 在 biz_date 当日已完成。
+
+    迟到回执确认后：
+    - 同 (来源, 日期) 的待派发/已派发补采任务被拦截回收，该日期不得复采；
+    - 同范围补采条目转已覆盖并登记回执；
+    - 关联的每条原排程各自回写已核结果（保留自己的业务日期）；
+    - 同名分片其他业务日期的任务与排程完全不受影响。
+    """
+    batch_svc = service_for("capture_batch")
+    queue_svc = service_for("task_queue")
+    recapture_svc = service_for("recapture_list")
+    plan_svc = service_for("schedule_plan")
+
+    receipt = batch_svc.accept_late_receipt(
+        source=source, biz_date=biz_date, checksum=checksum
+    )
+    batch_code = receipt["批次编号"]
+
+    affected_tasks: list[int] = []
+    for task in queue_svc.list_entries(size=10000)[0]:
+        if task.get("来源分片") != source or task.get("业务日期") != biz_date:
+            continue
+        if task.get("status") in ("待派发", "已派发"):
+            queue_svc.run_action(task["id"], "回收任务")
+            task["占用节点"] = ""
+            affected_tasks.append(task["id"])
+            item_id_raw = task.get("补采条目")
+            if str(item_id_raw or "").isdigit():
+                item_id = int(item_id_raw)
+                item = recapture_svc.get_entry(item_id)
+                if item is not None and item.get("已核结果") not in ("已确认", "已覆盖"):
+                    recapture_svc.run_action(item_id, "标记覆盖")
+                    item["已核结果"] = "已覆盖"
+                    item["批次回执"] = batch_code
+                    item["占用任务"] = ""
+                    for plan_id in item.get("_关联排程ids", []):
+                        plan_svc.record_verification(
+                            plan_id, result="已覆盖",
+                            receipt=batch_code, batch_id=receipt["batch_id"],
+                        )
+
+    _recap_audit(
+        f"采集批次.{batch_code}",
+        "迟到回执",
+        (f"来源{source}的{biz_date}迟到回执确认，拦截补采任务"
+         f"{len(affected_tasks)}个；其他业务日期不受影响"),
+        "recap-late",
+    )
+    return {
+        "status": "late_received",
+        "来源分片": source,
+        "业务日期": biz_date,
+        "batch_id": receipt["batch_id"],
+        "批次回执": batch_code,
+        "deduplicated": receipt.get("deduplicated", False),
+        "affected_tasks": affected_tasks,
+    }
+
+
+def interrupt_recapture_attempt(item_id: int, reason: str) -> dict[str, Any]:
+    """中断补采尝试：任务回待派发、条目转已中断，失败原因与已确认数据保留。"""
+    recapture_svc = service_for("recapture_list")
+    queue_svc = service_for("task_queue")
+    item = recapture_svc.get_entry(int(item_id))
+    if item is None:
+        return {"status": "error", "reason": "补采条目不存在"}
+
+    task_code = item.get("占用任务", "")
+    task_id = None
+    for task in queue_svc.list_entries(size=10000)[0]:
+        if task.get("队列编号") == task_code:
+            task_id = task["id"]
+            break
+    if task_id is not None:
+        queue_svc.interrupt_task(task_id, reason)
+
+    recapture_svc.run_action(item["id"], "中断补采")
+    item["已核结果"] = "已中断"
+    item["最近中断"] = reason
+    item["占用任务"] = ""
+
+    plan_svc = service_for("schedule_plan")
+    for plan_id in item.get("_关联排程ids", []):
+        plan_svc.mark_collection_failed(plan_id, reason)
+
+    _recap_audit(
+        f"补采清单.{item.get('清单编号')}",
+        "补采中断",
+        f"来源{item.get('来源分片')}的{item.get('业务日期')}补采中断：{reason}",
+        "recap-interrupt",
+    )
+    return {"status": "interrupted", "item_id": item_id, "task_id": task_id, "reason": reason}
+
+
+def resume_recapture_attempt(item_id: int, node_code: str) -> dict[str, Any]:
+    """接续中断的补采：重新打开条目并重新提交任务，可再次派发。
+
+    已确认数据和失败原因仍保留在排程账本与审计轨迹里；若中断期间
+    迟到回执覆盖了该日期，派发防护会再次拦截，不会复采。
+    """
+    recapture_svc = service_for("recapture_list")
+    queue_svc = service_for("task_queue")
+    batch_svc = service_for("capture_batch")
+    item = recapture_svc.get_entry(int(item_id))
+    if item is None:
+        return {"status": "error", "reason": "补采条目不存在"}
+
+    # 中断期间迟到回执已覆盖该日期：不再重新打开，直接拦截，禁止复采
+    if batch_svc.is_covered(item["来源分片"], item["业务日期"]):
+        if item.get("已核结果") not in ("已确认", "已覆盖"):
+            recapture_svc.run_action(item_id, "标记覆盖")
+            item["已核结果"] = "已覆盖"
+        coverage = batch_svc.find_coverage(item["来源分片"], item["业务日期"]) or {}
+        return {
+            "status": "blocked",
+            "reason": f"来源{item['来源分片']}的{item['业务日期']}已被迟到回执覆盖，禁止复采",
+            "批次回执": coverage.get("批次编号", ""),
+        }
+
+    reopened = recapture_svc.reopen_item(item_id)
+    if not reopened.get("ok"):
+        return {"status": "error", "reason": reopened.get("reason")}
+
+    # 找到中断时挂起的原任务（同来源同日期、待派发），优先复用而非新建
+    candidate = None
+    for task in queue_svc.list_entries(size=10000)[0]:
+        if (task.get("来源分片") == item["来源分片"]
+                and task.get("业务日期") == item["业务日期"]
+                and task.get("status") == "待派发"):
+            candidate = task
+            break
+    if candidate is None:
+        candidate = queue_svc.enqueue_recapture_task(
+            source=item["来源分片"],
+            biz_date=item["业务日期"],
+            recapture_item_id=item["id"],
+        )
+    queue_svc.requeue_task(candidate["id"])
+    dispatch = queue_svc.dispatch_to_node(candidate["id"], node_code)
+    if not dispatch.get("ok"):
+        recapture_svc.run_action(item_id, "标记覆盖")
+        item["已核结果"] = "已覆盖"
+        item["批次回执"] = "scope-covered"
+        return {"status": "blocked", "reason": dispatch.get("reason"), "task_id": candidate["id"]}
+
+    recapture_svc.run_action(item_id, "领用补采")
+    item["已核结果"] = "补采中"
+    item["占用任务"] = candidate["队列编号"]
+    return {
+        "status": "resumed",
+        "item_id": item_id,
+        "task_id": candidate["id"],
+        "node": node_code,
+    }
+
+
+def confirm_recapture_attempt(task_id: int) -> dict[str, Any]:
+    """任务队列产生归集确认：按来源与业务日期回写每条原排程与补采条目。"""
+    result = service_for("task_queue").confirm_recapture_collection(task_id)
+    if not result.get("ok"):
+        return {"status": "error", **result}
+    _recap_audit(
+        f"采集批次.{result['批次回执']}",
+        "补采归集确认",
+        (f"来源{result['来源分片']}的{result['业务日期']}补采归集确认，"
+         f"回执{result['批次回执']}，已按来源与业务日期回写原排程"),
+        "recap-confirm",
+    )
+    return {"status": "confirmed", **result}

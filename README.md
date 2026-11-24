@@ -11,7 +11,7 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
-│   ├── src/data/modules.ts              18个业务模块配置
+│   ├── src/data/modules.ts              23个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
@@ -71,7 +71,8 @@ npm run dev
 | 版本发布 | `version_release` | 发布版本 | 发布编号、关联模板、版本号 |
 | 运行指标 | `metric_board` | 指标读数 | 读数编号、统计维度、统计窗口 |
 | 抽检样本 | `sample_check` | 抽检样本 | 样本编号、关联批次、抽样比例 |
-| 交接包 | `handoff_pack` | 交接包 | 交接编号、关联批次、目标系统 |
+| 交接包 | `handoff_pack` | 交接编号、关联批次、目标系统 |
+| 补采清单 | `recapture_list` | 补采条目 | 清单编号、来源分片、业务日期 |
 
 ## 约定
 
@@ -80,6 +81,24 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 补采核对链路（链路11）
+
+失败排程批量核对与补采在 `app/pipeline.py` 中串成一条端到端链路，覆盖范围
+按「上游来源 + 业务日期」精确判定：
+
+1. `build_recapture_plan`：批量选中的失败排程先与已确认采集批次核对，
+   已覆盖的范围不进清单，真正缺口才生成 `recapture_list` 条目；同一
+   （来源分片, 业务日期）的多个排程折叠成一条（有效归集只计一次），
+   但每条排程各自保留数据日期、失败原因与已核结果。
+2. `claim_recapture_attempt`：补采条目入任务队列并按节点并发额度领用，
+   名额占满时其余条目排队等待。
+3. `register_late_receipt`：旧机器人迟到回执只确认它携带的那个业务日期，
+   同日期补采任务被拦截回收（不得复采），同名分片的其他日期不受影响。
+4. `interrupt_recapture_attempt` / `resume_recapture_attempt`：中断后任务
+   回待派发、失败原因留痕，可再次提交；若中断期间被迟到回执覆盖则继续拦截。
+5. `confirm_recapture_attempt`：任务队列产生的归集确认按来源与业务日期
+   回写每条原排程，各日结果分别可追溯到批次回执，不能仅凭同名分片判整组完成。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA
